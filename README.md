@@ -1,12 +1,13 @@
 # Whisper STT Cloud API integration for Home Assistant 🏠🎙️
 
-This HA custom integration lets you use any compatible OpenAI API (OpenAI, GroqCloud, Mistral AI, others coming ...) for computing speech-to-text in cloud, reducing workload on Home Assistant server.
+This HA custom integration lets you use compatible cloud speech-to-text APIs (OpenAI, GroqCloud, Mistral AI, OpenRouter, others coming ...) for computing speech-to-text in cloud, reducing workload on Home Assistant server.
 
 ## Sources
 
 - *OpenAI*
 - *GroqCloud*
 - *Mistral AI*
+- *OpenRouter*
 - *Custom*
 
 ## OpenAI
@@ -48,9 +49,31 @@ Currently all Mistral AI models are free up to 1 billion token per month !
 
 - `voxtral-mini`
 
+## OpenRouter
+
+### Requirements 📖
+
+- An OpenRouter account 👤  --> You can create one [here](https://openrouter.ai/)
+- An `API Key` 🔑 --> You can generate one [here](https://openrouter.ai/settings/keys)
+
+### Models
+
+The integration fetches the current OpenRouter model list and shows models that support audio input and text output.
+
+If the model list cannot be loaded, these fallback models are available:
+
+- `openai/gpt-audio-mini`
+- `openai/gpt-audio`
+- `openai/gpt-4o-audio-preview`
+- `mistralai/voxtral-small-24b-2507`
+- `google/gemini-2.5-flash-lite`
+- `google/gemini-2.0-flash-lite-001`
+
+OpenRouter does not support the OpenAI `/v1/audio/transcriptions` endpoint. This integration uses OpenRouter's `/api/v1/chat/completions` API with base64-encoded WAV audio and asks the selected model to return transcript text only.
+
 ## Custom
 
-Any other OpenAI compatible api
+Any other OpenAI-compatible `/v1/audio/transcriptions` endpoint. Custom mode does not support OpenRouter's chat-completions audio API; use the OpenRouter source instead.
 
 ## How to install ⚙️
 
