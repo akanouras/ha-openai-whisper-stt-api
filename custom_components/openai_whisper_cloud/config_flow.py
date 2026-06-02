@@ -34,6 +34,7 @@ from homeassistant.helpers.selector import (
 from .const import (
     _LOGGER,
     CONF_CUSTOM_PROVIDER,
+    CONF_OPENROUTER_REQUEST_MODE,
     CONF_PROMPT,
     CONF_TEMPERATURE,
     DEFAULT_PROMPT,
@@ -42,6 +43,8 @@ from .const import (
     SUPPORTED_LANGUAGES,
 )
 from .whisper_provider import (
+    OPENROUTER_LEGACY_MODEL_NOTE,
+    REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
     REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
     WhisperModel,
     WhisperProvider,
@@ -49,6 +52,10 @@ from .whisper_provider import (
 )
 
 REQUEST_TIMEOUT = 30
+OPENROUTER_REQUEST_MODES = {
+    REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
+    REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
+}
 
 PROVIDER_SELECTION_SCHEMA = vol.Schema(
     {
@@ -66,8 +73,49 @@ PROVIDER_SELECTION_SCHEMA = vol.Schema(
 
 
 def _is_openrouter_provider(provider: WhisperProvider) -> bool:
-    """Return true if the provider uses OpenRouter chat audio requests."""
-    return provider.request_mode == REQUEST_MODE_OPENROUTER_CHAT_AUDIO
+    """Return true if the provider uses OpenRouter-specific requests."""
+    return provider.request_mode in OPENROUTER_REQUEST_MODES
+
+
+def _openrouter_model_description_placeholders(
+    provider: WhisperProvider | None = None,
+) -> dict[str, str]:
+    """Return dynamic placeholders for model field descriptions."""
+    return {
+        "openrouter_model_note": OPENROUTER_LEGACY_MODEL_NOTE
+        if provider and _is_openrouter_provider(provider)
+        else ""
+    }
+
+
+def _openrouter_model_request_mode(model: WhisperModel) -> str:
+    """Return an OpenRouter model's request mode."""
+    return model.request_mode or REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS
+
+
+def _openrouter_saved_model_request_mode(
+    selected_request_mode: str | None = None,
+) -> str:
+    """Return the request mode for a saved OpenRouter model missing from catalogs."""
+    if selected_request_mode in OPENROUTER_REQUEST_MODES:
+        return selected_request_mode
+
+    return REQUEST_MODE_OPENROUTER_CHAT_AUDIO
+
+
+def _openrouter_model_label(
+    model_id: str, model_name: str | None, request_mode: str
+) -> str:
+    """Return the OpenRouter selector label for a model."""
+    label = (
+        f"{model_name} ({model_id})"
+        if model_name and model_name != model_id
+        else model_id
+    )
+    if request_mode == REQUEST_MODE_OPENROUTER_CHAT_AUDIO:
+        label = f"{label} *"
+
+    return label
 
 
 def _stored_model_value(provider: WhisperProvider, model_name: str) -> int | str:
@@ -91,14 +139,21 @@ def _entry_model_name(entry: ConfigEntry, provider: WhisperProvider) -> str:
 
 
 def _include_selected_model(
-    models: list[WhisperModel], selected_model: str | None
+    models: list[WhisperModel],
+    selected_model: str | None,
+    selected_request_mode: str | None = None,
 ) -> list[WhisperModel]:
     """Keep a previously saved OpenRouter model selectable."""
     if not selected_model or selected_model in [model.name for model in models]:
         return models
 
+    request_mode = _openrouter_saved_model_request_mode(selected_request_mode)
+    label = f"{selected_model} (saved)"
+    if request_mode == REQUEST_MODE_OPENROUTER_CHAT_AUDIO:
+        label = f"{label} *"
+
     return [
-        WhisperModel(selected_model, SUPPORTED_LANGUAGES, f"{selected_model} (saved)"),
+        WhisperModel(selected_model, SUPPORTED_LANGUAGES, label, request_mode),
         *models,
     ]
 
@@ -106,33 +161,70 @@ def _include_selected_model(
 async def async_get_openrouter_models(
     provider: WhisperProvider,
 ) -> tuple[list[WhisperModel], bool]:
-    """Fetch OpenRouter models that accept audio and return text."""
+    """Fetch OpenRouter STT and legacy audio-chat models."""
     try:
-        response = await asyncio.to_thread(
+        stt_response = await asyncio.to_thread(
+            requests.get,
+            url=f"{provider.url}/v1/models?output_modalities=transcription",
+            timeout=REQUEST_TIMEOUT,
+        )
+        legacy_response = await asyncio.to_thread(
             requests.get,
             url=f"{provider.url}/v1/models",
             timeout=REQUEST_TIMEOUT,
         )
 
         _LOGGER.debug(
-            "OpenRouter models request took %f s and returned %d - %s",
-            response.elapsed.total_seconds(),
-            response.status_code,
-            response.reason,
+            "OpenRouter STT models request took %f s and returned %d - %s",
+            stt_response.elapsed.total_seconds(),
+            stt_response.status_code,
+            stt_response.reason,
+        )
+        _LOGGER.debug(
+            "OpenRouter legacy models request took %f s and returned %d - %s",
+            legacy_response.elapsed.total_seconds(),
+            legacy_response.status_code,
+            legacy_response.reason,
         )
 
-        if response.status_code != 200:
+        if stt_response.status_code != 200 or legacy_response.status_code != 200:
             _LOGGER.warning(
-                "OpenRouter models request failed with status %d; using fallback models",
-                response.status_code,
+                "OpenRouter models request failed; using fallback models"
             )
             return provider.models, False
 
-        model_data = response.json().get("data", [])
-        models: list[WhisperModel] = []
+        stt_model_data = stt_response.json().get("data", [])
+        legacy_model_data = legacy_response.json().get("data", [])
+        stt_models: list[WhisperModel] = []
+        legacy_models: list[WhisperModel] = []
         seen: set[str] = set()
 
-        for model in model_data:
+        for model in stt_model_data:
+            model_id = model.get("id")
+            architecture = model.get("architecture") or {}
+            input_modalities = architecture.get("input_modalities") or []
+            output_modalities = architecture.get("output_modalities") or []
+
+            if (
+                not model_id
+                or model_id in seen
+                or "audio" not in input_modalities
+                or "transcription" not in output_modalities
+            ):
+                continue
+
+            seen.add(model_id)
+            request_mode = REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS
+            stt_models.append(
+                WhisperModel(
+                    model_id,
+                    SUPPORTED_LANGUAGES,
+                    _openrouter_model_label(model_id, model.get("name"), request_mode),
+                    request_mode,
+                )
+            )
+
+        for model in legacy_model_data:
             model_id = model.get("id")
             architecture = model.get("architecture") or {}
             input_modalities = architecture.get("input_modalities") or []
@@ -143,21 +235,26 @@ async def async_get_openrouter_models(
                 or model_id in seen
                 or "audio" not in input_modalities
                 or "text" not in output_modalities
+                or "transcription" in output_modalities
             ):
                 continue
 
             seen.add(model_id)
-            model_name = model.get("name")
-            label = (
-                f"{model_name} ({model_id})"
-                if model_name and model_name != model_id
-                else model_id
+            request_mode = REQUEST_MODE_OPENROUTER_CHAT_AUDIO
+            legacy_models.append(
+                WhisperModel(
+                    model_id,
+                    SUPPORTED_LANGUAGES,
+                    _openrouter_model_label(model_id, model.get("name"), request_mode),
+                    request_mode,
+                )
             )
-            models.append(WhisperModel(model_id, SUPPORTED_LANGUAGES, label))
+
+        models = [*stt_models, *legacy_models]
 
         if not models:
             _LOGGER.warning(
-                "OpenRouter models response contained no audio-to-text models; using fallback models"
+                "OpenRouter models response contained no usable audio models; using fallback models"
             )
             return provider.models, False
 
@@ -174,12 +271,16 @@ async def async_get_openrouter_models(
 
 
 async def async_model_schema_entry(
-    provider: WhisperProvider, selected_model: str | None = None
+    provider: WhisperProvider,
+    selected_model: str | None = None,
+    selected_request_mode: str | None = None,
 ) -> tuple[vol.Required, vol.In | SelectSelector]:
     """Build the model schema entry for a provider."""
     if _is_openrouter_provider(provider):
         models, _models_available = await async_get_openrouter_models(provider)
-        models = _include_selected_model(models, selected_model)
+        models = _include_selected_model(
+            models, selected_model, selected_request_mode
+        )
         default_model = selected_model or provider.models[provider.default_model].name
 
         return vol.Required(CONF_MODEL, default=default_model), SelectSelector(
@@ -199,6 +300,20 @@ async def async_model_schema_entry(
         ),
         vol.In([x.name for x in provider.models]),
     )
+
+
+async def async_openrouter_request_mode_for_model(
+    provider: WhisperProvider, model_name: str, selected_request_mode: str | None = None
+) -> str:
+    """Return the request mode for an OpenRouter model name."""
+    models, _models_available = await async_get_openrouter_models(provider)
+    selected_model = next(
+        (model for model in models if model.name == model_name), None
+    )
+    if selected_model:
+        return _openrouter_model_request_mode(selected_model)
+
+    return _openrouter_saved_model_request_mode(selected_request_mode)
 
 
 async def validate_input(data: dict, provider: WhisperProvider):
@@ -242,10 +357,19 @@ async def validate_input(data: dict, provider: WhisperProvider):
             raise UnknownError
 
         models, models_available = await async_get_openrouter_models(provider)
-        if models_available and data.get(CONF_MODEL) not in [
-            model.name for model in models
-        ]:
+        selected_model = next(
+            (model for model in models if model.name == data.get(CONF_MODEL)), None
+        )
+        if selected_model:
+            data[CONF_OPENROUTER_REQUEST_MODE] = _openrouter_model_request_mode(
+                selected_model
+            )
+        elif data.get(CONF_OPENROUTER_REQUEST_MODE) in OPENROUTER_REQUEST_MODES:
+            pass
+        elif models_available:
             raise WhisperModelNotFound
+        else:
+            data[CONF_OPENROUTER_REQUEST_MODE] = _openrouter_saved_model_request_mode()
 
         _LOGGER.debug("OpenRouter user validation successful")
         return
@@ -296,12 +420,27 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
             provider = whisper_providers[self.config_entry.data[CONF_SOURCE]]
 
         if user_input is not None:
+            openrouter_request_mode = None
+            if provider and _is_openrouter_provider(provider):
+                openrouter_request_mode = await async_openrouter_request_mode_for_model(
+                    provider,
+                    user_input[CONF_MODEL],
+                    self.config_entry.options.get(CONF_OPENROUTER_REQUEST_MODE),
+                )
+
             return self.async_create_entry(
                 title=self.config_entry.title,
                 data={
                     CONF_MODEL: user_input[CONF_MODEL]
                     if custom_provider
                     else _stored_model_value(provider, user_input[CONF_MODEL]),
+                    **(
+                        {
+                            CONF_OPENROUTER_REQUEST_MODE: openrouter_request_mode
+                        }
+                        if openrouter_request_mode in OPENROUTER_REQUEST_MODES
+                        else {}
+                    ),
                     CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
                     CONF_PROMPT: user_input.get(CONF_PROMPT, DEFAULT_PROMPT),
                 },
@@ -314,7 +453,9 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
         else:
             suggested_model = _entry_model_name(self.config_entry, provider)
             model_schema_key, model_schema_value = await async_model_schema_entry(
-                provider, suggested_model
+                provider,
+                suggested_model,
+                self.config_entry.options.get(CONF_OPENROUTER_REQUEST_MODE),
             )
 
         return self.async_show_form(
@@ -336,6 +477,7 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
                 },
             ),
             errors=errors,
+            description_placeholders=_openrouter_model_description_placeholders(provider),
         )
 
 
@@ -399,6 +541,13 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
 
             try:
                 await validate_input(user_input, self._provider)
+                openrouter_request_mode = None
+                if _is_openrouter_provider(self._provider):
+                    openrouter_request_mode = (
+                        await async_openrouter_request_mode_for_model(
+                            self._provider, user_input[CONF_MODEL]
+                        )
+                    )
 
                 return self.async_create_entry(
                     title=user_input.get(CONF_NAME),
@@ -410,6 +559,13 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     options={
                         CONF_MODEL: _stored_model_value(
                             self._provider, user_input[CONF_MODEL]
+                        ),
+                        **(
+                            {
+                                CONF_OPENROUTER_REQUEST_MODE: openrouter_request_mode
+                            }
+                            if openrouter_request_mode in OPENROUTER_REQUEST_MODES
+                            else {}
                         ),
                         CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
                         CONF_PROMPT: user_input.get(CONF_PROMPT, DEFAULT_PROMPT),
@@ -468,6 +624,9 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+            description_placeholders=_openrouter_model_description_placeholders(
+                self._provider
+            ),
         )
 
     async def async_step_reconfigure(
@@ -545,6 +704,15 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                     provider
                 )
+                openrouter_request_mode = None
+                if _is_openrouter_provider(provider):
+                    openrouter_request_mode = (
+                        await async_openrouter_request_mode_for_model(
+                            provider,
+                            user_input[CONF_MODEL],
+                            entry.options.get(CONF_OPENROUTER_REQUEST_MODE),
+                        )
+                    )
 
                 self.hass.config_entries.async_update_entry(
                     entry=entry,
@@ -557,6 +725,13 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     options={
                         CONF_MODEL: _stored_model_value(
                             provider, user_input[CONF_MODEL]
+                        ),
+                        **(
+                            {
+                                CONF_OPENROUTER_REQUEST_MODE: openrouter_request_mode
+                            }
+                            if openrouter_request_mode in OPENROUTER_REQUEST_MODES
+                            else {}
                         ),
                         CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
                         CONF_PROMPT: user_input.get(CONF_PROMPT, DEFAULT_PROMPT),
@@ -578,7 +753,9 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "unknown"
 
         model_schema_key, model_schema_value = await async_model_schema_entry(
-            provider, selected_model
+            provider,
+            selected_model,
+            entry.options.get(CONF_OPENROUTER_REQUEST_MODE),
         )
 
         return self.async_show_form(
@@ -605,6 +782,7 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                 },
             ),
             errors=errors,
+            description_placeholders=_openrouter_model_description_placeholders(provider),
         )
 
 

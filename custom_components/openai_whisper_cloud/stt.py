@@ -35,6 +35,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import _LOGGER
 from .const import (
     CONF_CUSTOM_PROVIDER,
+    CONF_OPENROUTER_REQUEST_MODE,
     CONF_PROMPT,
     CONF_TEMPERATURE,
     SUPPORTED_LANGUAGES,
@@ -44,8 +45,14 @@ from .whisper_provider import (
     OPENROUTER_APP_REFERER,
     OPENROUTER_APP_TITLE,
     REQUEST_MODE_AUDIO_TRANSCRIPTIONS,
+    REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
     REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
 )
+
+OPENROUTER_REQUEST_MODES = {
+    REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
+    REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
+}
 
 OPENROUTER_TRANSCRIPTION_PROMPT = (
     "Transcribe the provided audio. Return only the spoken transcript text. "
@@ -84,7 +91,14 @@ async def async_setup_entry(
         provider = whisper_providers[config_entry.data[CONF_SOURCE]]
         api_url = provider.url
         request_mode = provider.request_mode
-        if request_mode == REQUEST_MODE_OPENROUTER_CHAT_AUDIO:
+        if provider.request_mode in OPENROUTER_REQUEST_MODES:
+            request_mode = config_entry.options.get(
+                CONF_OPENROUTER_REQUEST_MODE, REQUEST_MODE_OPENROUTER_CHAT_AUDIO
+            )
+        if request_mode in (
+            REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
+            REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
+        ):
             model = WhisperModel(config_entry.options[CONF_MODEL], SUPPORTED_LANGUAGES)
         else:
             model = provider.models[config_entry.options[CONF_MODEL]]
@@ -205,6 +219,11 @@ class OpenAIWhisperCloudEntity(SpeechToTextEntity):
             if self.request_mode == REQUEST_MODE_OPENROUTER_CHAT_AUDIO:
                 return await self._async_process_openrouter_audio(metadata, temp_file)
 
+            if self.request_mode == REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS:
+                return await self._async_process_openrouter_transcription_audio(
+                    metadata, temp_file
+                )
+
             return await self._async_process_transcriptions_audio(metadata, temp_file)
 
         except requests.exceptions.RequestException as e:
@@ -266,6 +285,74 @@ class OpenAIWhisperCloudEntity(SpeechToTextEntity):
             _LOGGER.error("Transcription response was not valid JSON: %s", e)
             return SpeechResult("", SpeechResultState.ERROR)
 
+        _LOGGER.debug("TRANSCRIPTION: %s", transcription)
+
+        if not transcription:
+            _LOGGER.error(response.text)
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        return SpeechResult(transcription, SpeechResultState.SUCCESS)
+
+    async def _async_process_openrouter_transcription_audio(
+        self, metadata: SpeechMetadata, temp_file: io.BytesIO
+    ) -> SpeechResult:
+        """Process audio through OpenRouter's dedicated transcription endpoint."""
+        openrouter_language = LANGUAGE_TO_WHISPER.get(
+            metadata.language.lower() if metadata.language else "",
+            metadata.language,
+        )
+        if openrouter_language != metadata.language:
+            _LOGGER.debug(
+                "Converted language '%s' to '%s' for OpenRouter STT API",
+                metadata.language,
+                openrouter_language,
+            )
+
+        payload = {
+            "model": self.model.name,
+            "input_audio": {
+                "data": base64.b64encode(temp_file.getvalue()).decode("ascii"),
+                "format": "wav",
+            },
+            "temperature": self.temperature,
+        }
+        if openrouter_language:
+            payload["language"] = openrouter_language
+
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{self.api_url}/v1/audio/transcriptions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": OPENROUTER_APP_REFERER,
+                "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+            },
+            json=payload,
+        )
+
+        _LOGGER.debug(
+            "OpenRouter STT request took %f s and returned %d - %s",
+            response.elapsed.total_seconds(),
+            response.status_code,
+            response.reason,
+        )
+
+        if response.status_code < 200 or response.status_code >= 300:
+            _LOGGER.error(response.text)
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        try:
+            transcription = response.json().get("text", "")
+        except (AttributeError, ValueError) as e:
+            _LOGGER.error("OpenRouter STT response was not valid JSON: %s", e)
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        if not isinstance(transcription, str):
+            _LOGGER.error("OpenRouter STT response text was not a string")
+            return SpeechResult("", SpeechResultState.ERROR)
+
+        transcription = transcription.strip()
         _LOGGER.debug("TRANSCRIPTION: %s", transcription)
 
         if not transcription:

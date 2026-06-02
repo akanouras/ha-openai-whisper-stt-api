@@ -58,9 +58,23 @@ Currently all Mistral AI models are free up to 1 billion token per month !
 
 ### Models
 
-The integration fetches the current OpenRouter model list and shows models that support audio input and text output.
+The integration fetches the current OpenRouter model list and shows dedicated speech-to-text models first. These models use OpenRouter's `/api/v1/audio/transcriptions` endpoint with base64-encoded WAV audio.
 
-If the model list cannot be loaded, these fallback models are available:
+Models marked with `*` do not support the transcription endpoint. They are still available through OpenRouter's `/api/v1/chat/completions` audio input API for compatibility.
+
+If the model list cannot be loaded, these fallback transcription models are available:
+
+- `openai/gpt-4o-mini-transcribe`
+- `openai/gpt-4o-transcribe`
+- `openai/whisper-1`
+- `openai/whisper-large-v3`
+- `openai/whisper-large-v3-turbo`
+- `mistralai/voxtral-mini-transcribe`
+- `nvidia/parakeet-tdt-0.6b-v3`
+- `google/chirp-3`
+- `qwen/qwen3-asr-flash-2026-02-10`
+
+These fallback legacy chat-audio models are also available and marked with `*`:
 
 - `openai/gpt-audio-mini`
 - `openai/gpt-audio`
@@ -68,8 +82,6 @@ If the model list cannot be loaded, these fallback models are available:
 - `mistralai/voxtral-small-24b-2507`
 - `google/gemini-2.5-flash-lite`
 - `google/gemini-2.0-flash-lite-001`
-
-OpenRouter does not support the OpenAI `/v1/audio/transcriptions` endpoint. This integration uses OpenRouter's `/api/v1/chat/completions` API with base64-encoded WAV audio and asks the selected model to return transcript text only.
 
 ## Custom
 
@@ -112,6 +124,7 @@ These are the parameters that you can configure:
 - `prompt`: (Optional) Can be used to **improve speech recognition** of words or even names. Default `""`
   <br>You have to provide a list of words or names separated by a comma `, `
   <br>Example: `"open, close, Chat GPT-3, DALL·E"`.
+  <br>For OpenRouter, `prompt` applies only to `*` legacy chat-audio models. OpenRouter's dedicated transcription endpoint does not support a generic prompt field.
 
 Now you can set it up through your Home Assistant Dashboard (YAML configuration not supported).
 

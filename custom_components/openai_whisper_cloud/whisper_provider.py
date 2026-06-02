@@ -3,6 +3,7 @@
 from .const import SUPPORTED_LANGUAGES
 
 REQUEST_MODE_AUDIO_TRANSCRIPTIONS = "audio_transcriptions"
+REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS = "openrouter_audio_transcriptions"
 REQUEST_MODE_OPENROUTER_CHAT_AUDIO = "openrouter_chat_audio"
 
 OPENROUTER_APP_REFERER = (
@@ -10,7 +11,24 @@ OPENROUTER_APP_REFERER = (
 )
 OPENROUTER_APP_TITLE = "OpenAI Whisper Cloud for Home Assistant"
 
-OPENROUTER_FALLBACK_MODEL_NAMES = [
+OPENROUTER_LEGACY_MODEL_NOTE = (
+    "* Models use OpenRouter chat completions audio because they do not "
+    "support the transcription endpoint."
+)
+
+OPENROUTER_STT_FALLBACK_MODEL_NAMES = [
+    "openai/gpt-4o-mini-transcribe",
+    "openai/gpt-4o-transcribe",
+    "openai/whisper-1",
+    "openai/whisper-large-v3",
+    "openai/whisper-large-v3-turbo",
+    "mistralai/voxtral-mini-transcribe",
+    "nvidia/parakeet-tdt-0.6b-v3",
+    "google/chirp-3",
+    "qwen/qwen3-asr-flash-2026-02-10",
+]
+
+OPENROUTER_LEGACY_FALLBACK_MODEL_NAMES = [
     "openai/gpt-audio-mini",
     "openai/gpt-audio",
     "openai/gpt-4o-audio-preview",
@@ -23,11 +41,18 @@ OPENROUTER_FALLBACK_MODEL_NAMES = [
 class WhisperModel:
     """Whisper Model."""
 
-    def __init__(self, name: str, languages: list, label: str | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        languages: list,
+        label: str | None = None,
+        request_mode: str | None = None,
+    ) -> None:
         """Init."""
         self.name = name
         self.languages = languages
         self.label = label or name
+        self.request_mode = request_mode
 
 
 class WhisperProvider:
@@ -81,11 +106,26 @@ whisper_providers = [
         "OpenRouter",
         "https://openrouter.ai/api",
         [
-            WhisperModel(model_name, SUPPORTED_LANGUAGES)
-            for model_name in OPENROUTER_FALLBACK_MODEL_NAMES
+            *[
+                WhisperModel(
+                    model_name,
+                    SUPPORTED_LANGUAGES,
+                    request_mode=REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
+                )
+                for model_name in OPENROUTER_STT_FALLBACK_MODEL_NAMES
+            ],
+            *[
+                WhisperModel(
+                    model_name,
+                    SUPPORTED_LANGUAGES,
+                    f"{model_name} *",
+                    REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
+                )
+                for model_name in OPENROUTER_LEGACY_FALLBACK_MODEL_NAMES
+            ],
         ],
         0,
-        REQUEST_MODE_OPENROUTER_CHAT_AUDIO,
+        REQUEST_MODE_OPENROUTER_AUDIO_TRANSCRIPTIONS,
     ),
     WhisperProvider("Custom", "", [], 0),
 ]
